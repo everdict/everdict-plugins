@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": ["mcp__everdict", "Read", "Glob", "Grep", "Write", "Edit", "WebFetch", "WebSearch", "Task", "TodoWrite"],
+    "ask": ["mcp__everdict__sandbox_git_push"],
+    "deny": ["Bash", "Monitor", "NotebookEdit"]
+  }
+}

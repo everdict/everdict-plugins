@@ -1,0 +1,24 @@
+{
+  "name": "everdict",
+  "owner": {
+    "name": "Everdict",
+    "url": "https://github.com/everdict/everdict"
+  },
+  "description": "The Everdict plugin — bring the Everdict evaluation runtime (the `everdict-api` REST door, skills and hooks) into any Claude Code session.",
+  "plugins": [
+    {
+      "name": "everdict",
+      "source": "./plugin",
+      "description": "Evaluate, benchmark, and regression-test your agent with Everdict: the `everdict-api` REST door, the domain model and eval workflows, and hooks that keep the work recorded.",
+      "category": "development",
+      "keywords": ["everdict", "evaluation", "benchmark", "agent", "scorecard", "mcp"]
+    },
+    {
+      "name": "everdict-lite",
+      "source": "./plugin-lite",
+      "description": "Use Everdict without the recorded development loop: one skill mapping features to the everdict-api REST door, a setup command, no hooks.",
+      "category": "development",
+      "keywords": ["everdict", "evaluation", "benchmark", "agent", "scorecard"]
+    }
+  ]
+}

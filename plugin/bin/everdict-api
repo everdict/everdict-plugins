@@ -1,0 +1,690 @@
+#!/usr/bin/env node
+// THE PLUGIN'S REST DOOR (DEFAUL-295). Zero dependencies, runs with `node` alone — the plugin has no build step.
+// (`bin/package.json` says `"type": "module"`, which is what makes this extensionless file ESM on every Node.)
+//
+//   everdict-api <op> [--<pathParam> <v>]… [--query k=v]… [--body <json> | --body @file | --body -]
+//                 [--reason "<text>"] sends x-everdict-effect-reason (percent-encoded UTF-8): why an irreversible effect (a cancel, a stop, a delete) is right — an agent credential must give it, and without it the server answers 400
+//                 [--approval <id>]   sends x-everdict-approval: spends the approved ask a 202 answer parked (an effect, a loosening adoption close, a kernel request) — send the SAME request again with the id; a reclaim (cancel, stop, close) parks nothing
+//   everdict-api ops [filter]         each operation with its method, path template and path params
+//   everdict-api describe <op>        the operation's OpenAPI entry from GET /docs/json (params, body schema)
+//   everdict-api raw <METHOD> <path> [--query k=v]… [--body …]     the escape hatch for a route the table lacks
+//   everdict-api watch <subject-pattern>[,…] [--after <pos> | --resume] [--kinds k1,k2] [--until <kind>[:<field>=<value>]] [--json]
+//                                     follows the /stream gateway (pub/sub spec §3.2): one line per frame, no total timeout
+//
+// An OPERATION NAME (`log_change_round`, `create_sandbox`, …) is the vocabulary the seed skills and the in-product
+// agent share; `hooks/lib/rest-ops.mjs` is the ONE table that turns it into a route. Bodies are the REST bodies
+// (camelCase), not the MCP argument shapes — `describe` is how to learn one.
+//
+// STDOUT CARRIES ONLY THE RESPONSE JSON, so it can be piped to `jq`. Everything else — refusals, notices, the
+// unknown-outcome message — is stderr.
+//
+//   exit 0  2xx
+//   exit 1  an HTTP error; the `{code,message,data?}` envelope is on stdout
+//   exit 2  refused BEFORE the request (a hook check, a bad argument, no credential) — nothing was sent
+//   exit 3  a transport failure (connection refused/reset, timeout): the outcome is UNKNOWN
+//   exit 4  the call succeeded and its record landed in a workspace the checkout does not declare (stdout is intact)
+//   `watch` extends the table: 0 `--until` matched · 2 refused before connecting · 3 could not connect in 5 attempts
+//   (unknown, never "no events") · 5 `resync` (the cursor is older than retention) · 6 credential refused mid-stream
+//
+// ── A TRANSPORT FAILURE IS `unknown`, NEVER AN EMPTY ANSWER (protocol L2) ─────────────────────────────────────
+// A connection that drops after the request left may or may not have been applied. So it exits 3 and says on
+// stderr that the request may or may not have landed, naming the read that finds out. GETs retry — bounded, three
+// retries after the first attempt, waiting 0.5 s, 1 s, 2 s. WRITES ARE NEVER RETRIED HERE: a second physical
+// attempt of `log_change_round` or `create_sandbox` is a second effect, and only the caller, after reading, can say
+// it was not applied.
+//
+// ── THE CHECKS THE MCP-KEYED HOOKS RAN, IN-PROCESS ───────────────────────────────────────────────────────
+// Imported from `hooks/lib/`, the same modules the hooks used — never copied here (L3):
+//   pre  log_change_round        a commit in this checkout needs its `at`, equal to git's       (record-checks)
+//   pre  create_issue            a `projectId`, or `noProjectBecause` saying why there is none   (record-checks)
+//   post every record            its `tenant` must be the workspace the checkout declares      (record-checks)
+//   pre  open_change_campaign    a `readiness_blocked` opt-out runs the bootstrap first        (readiness-checks)
+//   post delegation_readiness    a `blocked` answer runs the bootstrap once per session        (readiness-checks)
+//   post create_issue            what the issue lacks                                          (conventions-feedback)
+// A refusal is exit 2 BEFORE the request is sent. `raw` runs them too, when its path matches a table entry.
+//
+// ── THE SEAM FOR RECEIPTS ─────────────────────────────────────────────────────────────────────────────────────
+// Every call that reaches the network is one `call` (what was asked) and one `outcome` (what came back), and both
+// are handed to `settle()` — the single place a receipt can be derived from, whatever the status.
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import { resolveDoorCredential } from "../hooks/lib/api-credential.mjs";
+import { conventionsFeedback } from "../hooks/lib/conventions-feedback.mjs";
+import { issueGoalRefusal, roundRefusal, tenantWarning } from "../hooks/lib/record-checks.mjs";
+import { buildReceipt, emitReceipt, isSafeSessionId } from "../hooks/lib/receipts.mjs";
+import { isReadinessOptOut, readinessAfterRead, readinessBeforeOptOut } from "../hooks/lib/readiness-checks.mjs";
+import { REST_OPS, fillPath, findOp, opForRequest, pathParamsOf } from "../hooks/lib/rest-ops.mjs";
+import { controlLine, factLine, parseSse, parseUntil, resyncLines } from "../hooks/lib/watch.mjs";
+import { repositoryOf, resolveWorkspace } from "../hooks/lib/workspace.mjs";
+
+const EXIT = { ok: 0, http: 1, refused: 2, transport: 3, wrongWorkspace: 4, resync: 5, credentialRefused: 6 };
+const DEFAULT_RETRY_DELAYS_MS = [500, 1_000, 2_000];
+const DEFAULT_TIMEOUT_MS = 60_000;
+
+// `everdict-api ops | head` closes the pipe early; that is not a failure of the door.
+process.stdout.on("error", (err) => {
+  if (err.code === "EPIPE") process.exit(0);
+  throw err;
+});
+
+const say = (line) => process.stderr.write(`${line}\n`);
+class Refusal extends Error {}
+const refuse = (message) => {
+  throw new Refusal(message);
+};
+
+// ── argv ────────────────────────────────────────────────────────────────────────────────────────────────────
+const parseFlags = (tokens, pathParams) => {
+  const params = {};
+  const query = [];
+  let body;
+  let approval;
+  let reason;
+  const positional = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token.startsWith("--")) {
+      positional.push(token);
+      continue;
+    }
+    const name = token.slice(2);
+    const value = tokens[i + 1];
+    if (value === undefined) refuse(`--${name} needs a value`);
+    i++;
+    if (name === "body") body = value;
+    else if (name === "approval") {
+      // The id of an approved ask the server parked for this request (a 202 {approvalId, decider}); the server spends it once when the request's effect, target and digest match. A request that was not escalated ignores it.
+      if (value.trim() === "") refuse("--approval needs a non-empty approval id");
+      approval = value.trim();
+    }
+    else if (name === "reason") {
+      if (value.trim() === "") refuse("--reason needs a non-empty reason");
+      reason = value.trim();
+    } else if (name === "query") {
+      const eq = value.indexOf("=");
+      if (eq < 1) refuse(`--query takes k=v, got "${value}"`);
+      query.push([value.slice(0, eq), value.slice(eq + 1)]);
+    } else if (pathParams.includes(name)) params[name] = value;
+    else
+      refuse(
+        `unknown flag --${name}${pathParams.length > 0 ? ` (path params: ${pathParams.map((p) => `--${p}`).join(" ")})` : ""}`,
+      );
+  }
+  return { params, query, body, approval, reason, positional };
+};
+
+const readBody = (spec) => {
+  if (spec === undefined) return undefined;
+  let text;
+  try {
+    text = spec === "-" ? readFileSync(0, "utf8") : spec.startsWith("@") ? readFileSync(spec.slice(1), "utf8") : spec;
+  } catch (err) {
+    return refuse(`--body could not be read: ${err instanceof Error ? err.message : "unreadable"}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return refuse("--body is not valid JSON");
+  }
+};
+
+// ── the network ─────────────────────────────────────────────────────────────────────────────────────────────
+const causeOf = (err) => {
+  if (err?.name === "TimeoutError" || err?.name === "AbortError") return "timeout";
+  return err?.cause?.code ?? err?.code ?? (err instanceof Error ? err.message : "network error");
+};
+
+const delays = () => {
+  const raw = process.env.EVERDICT_API_RETRY_DELAYS_MS;
+  if (raw === undefined) return DEFAULT_RETRY_DELAYS_MS;
+  return raw
+    .split(",")
+    .map((n) => Number(n))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+};
+
+const attempt = async ({ method, url, headers, body }) => {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(Number(process.env.EVERDICT_API_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS),
+    });
+    return { kind: "response", status: res.status, text: await res.text() };
+  } catch (err) {
+    return { kind: "transport", cause: causeOf(err) };
+  }
+};
+
+// GET retries; a write is one physical attempt, always.
+const send = async (request) => {
+  const waits = request.method === "GET" ? delays() : [];
+  let last = await attempt(request);
+  for (const wait of waits) {
+    if (last.kind !== "transport") break;
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    last = await attempt(request);
+  }
+  return { ...last, attempts: last.kind === "transport" && request.method === "GET" ? waits.length + 1 : 1 };
+};
+
+// The read that finds out whether a write that dropped was applied.
+const FIND_OUT = {
+  open_change_campaign: "everdict-api list_change_campaigns",
+  log_change_round: "everdict-api get_change_campaign --id {id}",
+  close_change_campaign: "everdict-api get_change_campaign --id {id}",
+  mint_change_report: "everdict-api get_change_campaign --id {id}",
+  review_change_report: "everdict-api raw GET /change-reports/{id}",
+  create_issue: "everdict-api list_issues",
+  update_issue: "everdict-api get_issue --id {id}",
+  set_issue_status: "everdict-api get_issue --id {id}",
+  create_sandbox: "everdict-api raw GET /sandboxes",
+  close_sandbox: "everdict-api get_sandbox --id {id}",
+  sandbox_exec: "everdict-api get_sandbox --id {id}",
+  submit_sandbox_task: "everdict-api get_sandbox --id {id}",
+  interrupt_sandbox_task: "everdict-api get_sandbox --id {id}",
+  open_campaign: "everdict-api raw GET /campaigns",
+  log_campaign_round: "everdict-api raw GET /campaigns/{id}",
+  settle_campaign: "everdict-api raw GET /campaigns/{id}",
+  submit_run: "everdict-api list_runs",
+  run_scorecard: "everdict-api list_scorecards",
+};
+const findOutCommand = (call) => {
+  const template = call.op ? FIND_OUT[call.op] : undefined;
+  if (template === undefined) return "read the resource back (`everdict-api ops get_` / `list_` name the reads)";
+  return template.replace(/\{(\w+)\}/g, (_, name) => call.pathParams[name] ?? `<${name}>`);
+};
+
+// The session this call belongs to: EVERDICT_SESSION_ID (exported by session-start) else CLAUDE_CODE_SESSION_ID, which
+// Claude Code puts in every Bash call — so a session that predates the export is still journaled. The first one SET
+// wins, and both consumers (the journal, the header) run it through `isSafeSessionId`, so an unsafe value gives neither.
+const sessionIdOf = () => process.env.EVERDICT_SESSION_ID?.trim() || process.env.CLAUDE_CODE_SESSION_ID?.trim() || undefined;
+
+// ── the one seam ──────────────────────────────────────────────────────────────────────────────────────────────
+// `call`: {op, method, path, pathParams, body}; `outcome`: the `send` result. ONE receipt per call, whatever the
+// status — a transport failure is a receipt with `status: "unknown"` (`hooks/lib/receipts.mjs`).
+const settle = (call, outcome, identity) => {
+  emitReceipt(buildReceipt({ ...call, identity }, outcome, record), {
+    sessionId: sessionIdOf(),
+    printLine: PRINT_RECEIPT,
+  });
+};
+
+const record = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
+// ── the call ──────────────────────────────────────────────────────────────────────────────────────────────────
+const context = () => {
+  const cwd = process.cwd();
+  const resolved = resolveWorkspace(cwd);
+  const linked = resolved?.kind === "linked" ? resolved : undefined;
+  const { apiBase, key, workspace, identity, refusal } = resolveDoorCredential({ workspace: linked?.workspace });
+  return { cwd, linked, apiBase, key, workspace, identity, refusal, session: sessionIdOf() };
+};
+
+// The plugin's own version, so a deployment that declares pluginCompat can refuse a write from an old one
+// (distributed spec §8.1). Unreadable → header left off: the server reads an absent header as "unknown".
+const PLUGIN_MANIFEST = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL("../.claude-plugin/plugin.json", import.meta.url), "utf8"));
+  } catch {
+    return {};
+  }
+})();
+const PLUGIN_VERSION = PLUGIN_MANIFEST.version;
+// everdict-lite has no hooks, so nothing reads the EVERDICT_RECEIPT stderr line: its door keeps the session journal
+// and prints nothing (PLT-100). Keyed on the plugin's identity, never on a user-settable switch.
+const PRINT_RECEIPT = PLUGIN_MANIFEST.name !== "everdict-lite";
+
+const headersOf = ({ key, workspace, session }, approval, reason) => ({
+  accept: "application/json",
+  "content-type": "application/json",
+  ...(key ? { Authorization: `Bearer ${key}` } : {}),
+  ...(workspace ? { "x-everdict-workspace": workspace } : {}),
+  ...(typeof PLUGIN_VERSION === "string" ? { "x-everdict-plugin": PLUGIN_VERSION } : {}),
+  // The identity an MCP session carried implicitly: without it `get_task_context` files no retrieval receipt
+  // (DEFAUL-308). An id the server would refuse as unsafe is left off rather than failing every call.
+  ...(isSafeSessionId(session) ? { "x-everdict-session": session } : {}),
+  // Spends the approved ask a 202 parked for this same request (DEFAUL-676, DEFAUL-748); a request within the caller's authority parks nothing. An approval id is a reference, not a secret.
+  ...(approval !== undefined ? { "x-everdict-approval": approval } : {}),
+  // Why an irreversible effect is right (DEFAUL-749). Percent-encoded UTF-8 so a reason in any language fits a header.
+  ...(reason !== undefined ? { "x-everdict-effect-reason": encodeURIComponent(reason) } : {}),
+});
+
+const urlOf = (ctx, path, query) => {
+  if (!ctx.apiBase)
+    refuse(
+      "no API URL: link this repository (`.everdict/workspace` + a registered key) or set EVERDICT_API_URL / EVERDICT_API_KEY",
+    );
+  const qs = query.length > 0 ? `${path.includes("?") ? "&" : "?"}${new URLSearchParams(query).toString()}` : "";
+  return `${ctx.apiBase}${path}${qs}`;
+};
+
+const unknownOutcome = (call, outcome) => {
+  say(
+    `everdict-api: ${call.method} ${call.path} — transport failure (${outcome.cause}) after ${outcome.attempts} attempt(s). The outcome is UNKNOWN, not empty: the request may or may not have landed.`,
+  );
+  if (call.method === "GET") say("  It is a read, so nothing was changed — run it again, or check the API is up.");
+  else say(`  It was NOT retried (a second attempt is a second effect). Find out first: ${findOutCommand(call)}`);
+};
+
+const runCall = async (ctx, call, query) => {
+  // pre-checks — refuse BEFORE anything is sent
+  if (call.op === "log_change_round" && ctx.linked) {
+    const refusal = roundRefusal({
+      resolved: ctx.linked,
+      body: call.body,
+      campaignId: call.pathParams.id,
+      session: ctx.session,
+      transcriptPath: process.env.EVERDICT_TRANSCRIPT_PATH?.trim() || undefined,
+    });
+    if (refusal !== undefined) refuse(refusal);
+  }
+  if (call.op === "create_issue") {
+    const refusal = issueGoalRefusal({ body: call.body });
+    if (refusal !== undefined) refuse(refusal);
+  }
+  if (call.op === "open_change_campaign" && ctx.linked && isReadinessOptOut(call.body)) {
+    const verdict = await readinessBeforeOptOut({ workspace: ctx.linked.workspace });
+    if (verdict.decision === "deny") refuse(verdict.text);
+    say(verdict.text);
+  }
+
+  // The credential could not be chosen (DEFAUL-404): nothing is sent, because the alternative is an anonymous write.
+  if (ctx.refusal !== undefined) refuse(ctx.refusal);
+  const outcome = await send({
+    method: call.method,
+    url: urlOf(ctx, call.path, query),
+    headers: headersOf(ctx, call.approval, call.reason),
+    body: call.body,
+  });
+  settle(call, outcome, ctx.identity);
+  if (outcome.kind === "transport") {
+    unknownOutcome(call, outcome);
+    return EXIT.transport;
+  }
+
+  const parsed = record(outcome.text);
+  const ok = outcome.status >= 200 && outcome.status < 300;
+  if (ok) {
+    process.stdout.write(
+      `${outcome.text.trim() === "" ? "null" : parsed === undefined ? JSON.stringify(outcome.text) : outcome.text.trim()}\n`,
+    );
+  } else {
+    const envelope = parsed ?? {
+      code: `HTTP_${outcome.status}`,
+      message: outcome.text.trim() || `HTTP ${outcome.status}`,
+    };
+    process.stdout.write(`${JSON.stringify(envelope)}\n`);
+    return EXIT.http;
+  }
+
+  // post-checks — the call has happened, so these speak; they do not undo
+  let code = EXIT.ok;
+  if (ctx.linked && parsed !== undefined) {
+    const warning = tenantWarning({ resolved: ctx.linked, record: parsed, session: ctx.session, op: call.op ?? "raw" });
+    if (warning !== undefined) {
+      say(warning);
+      code = EXIT.wrongWorkspace;
+    }
+  }
+  if (call.op === "delegation_readiness" && ctx.linked) {
+    const notice = await readinessAfterRead({ reading: parsed, workspace: ctx.linked.workspace, session: ctx.session });
+    if (notice !== undefined) say(notice);
+  }
+  if (call.op === "create_issue") {
+    let repository;
+    try {
+      repository = repositoryOf(ctx.cwd);
+    } catch {
+      repository = undefined;
+    }
+    const feedback = conventionsFeedback({ response: parsed, repository });
+    if (feedback !== undefined) say(feedback);
+  }
+  return code;
+};
+
+// ── subcommands ─────────────────────────────────────────────────────────────────────────────────────────────
+const listOps = (filter) => {
+  const rows = REST_OPS.filter(
+    (entry) => filter === undefined || entry.op.includes(filter) || entry.path.includes(filter),
+  );
+  if (rows.length === 0) refuse(`no operation matches "${filter}"`);
+  for (const entry of rows) {
+    const params = pathParamsOf(entry.path).map((p) => `--${p}`);
+    process.stdout.write(
+      `${entry.op}\t${entry.method}\t${entry.path}${params.length > 0 ? `\t${params.join(" ")}` : ""}\n`,
+    );
+  }
+  return EXIT.ok;
+};
+
+// `#/components/...` references inlined, with a depth bound and a cycle guard — an agent reads one document.
+const inline = (node, spec, seen = [], depth = 0) => {
+  if (Array.isArray(node)) return node.map((n) => inline(n, spec, seen, depth));
+  if (!node || typeof node !== "object") return node;
+  if (typeof node.$ref === "string" && node.$ref.startsWith("#/")) {
+    if (seen.includes(node.$ref) || depth > 8) return { $ref: node.$ref };
+    const target = node.$ref
+      .slice(2)
+      .split("/")
+      .reduce((cursor, part) => cursor?.[part.replaceAll("~1", "/").replaceAll("~0", "~")], spec);
+    return target === undefined ? node : inline(target, spec, [...seen, node.$ref], depth + 1);
+  }
+  return Object.fromEntries(Object.entries(node).map(([k, v]) => [k, inline(v, spec, seen, depth)]));
+};
+
+const describeOp = async (ctx, name) => {
+  const entry = findOp(name);
+  if (!entry) refuse(`unknown operation "${name}" — \`everdict-api ops\` lists them`);
+  // `op: null` — a `describe` READS the spec; a receipt naming the described op would read as that op having been called.
+  const call = { op: null, method: "GET", path: "/docs/json", pathParams: {}, body: undefined };
+  if (ctx.refusal !== undefined) refuse(ctx.refusal);
+  const outcome = await send({ method: "GET", url: urlOf(ctx, "/docs/json", []), headers: headersOf(ctx) });
+  settle(call, outcome, ctx.identity);
+  if (outcome.kind === "transport") {
+    unknownOutcome(call, outcome);
+    return EXIT.transport;
+  }
+  const spec = record(outcome.text);
+  if (outcome.status < 200 || outcome.status >= 300 || spec === undefined) {
+    process.stdout.write(
+      `${JSON.stringify(spec ?? { code: `HTTP_${outcome.status}`, message: "GET /docs/json did not answer an OpenAPI document" })}\n`,
+    );
+    return EXIT.http;
+  }
+  const operation = spec.paths?.[entry.path]?.[entry.method.toLowerCase()];
+  process.stdout.write(
+    `${JSON.stringify({
+      op: entry.op,
+      method: entry.method,
+      path: entry.path,
+      pathParams: pathParamsOf(entry.path),
+      operation: operation === undefined ? null : inline(operation, spec),
+    })}\n`,
+  );
+  return EXIT.ok;
+};
+
+// ── watch (DEFAUL-959) ────────────────────────────────────────────────────────────────────────────────────────
+// The 60 s DEFAULT_TIMEOUT_MS is for request/response operations; a watch has NO total timeout. It has an idle
+// timeout of 45 s (3 × the server's 15 s heartbeat), then reconnects with backoff from the cursor.
+const WATCH_IDLE_MS = 45_000;
+const WATCH_BACKOFF_MS = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+const WATCH_CONNECT_ATTEMPTS = 5;
+
+const watchNumbers = (name, fallback) => {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = raw.split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0);
+  return parsed.length > 0 ? parsed : fallback;
+};
+
+const parseWatchArgs = (tokens) => {
+  const opts = { patterns: [], after: undefined, resume: false, kinds: undefined, until: undefined, json: false };
+  const positional = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (!token.startsWith("--")) {
+      positional.push(token);
+      continue;
+    }
+    const name = token.slice(2);
+    if (name === "resume") opts.resume = true;
+    else if (name === "json") opts.json = true;
+    else if (["after", "kinds", "until"].includes(name)) {
+      const value = tokens[++i];
+      if (value === undefined || value === "") refuse(`--${name} needs a value`);
+      if (name === "after") {
+        if (!/^\d+$/.test(value)) refuse(`--after takes a pos (a non-negative integer), got "${value}"`);
+        opts.after = Number(value);
+      } else if (name === "kinds") opts.kinds = value;
+      else opts.until = value;
+    } else refuse(`unknown flag --${name} (watch takes --after, --resume, --kinds, --until, --json)`);
+  }
+  if (positional.length !== 1) refuse("watch takes one <subject-pattern>[,<pattern>…]");
+  opts.patterns = positional[0].split(",").filter((p) => p.length > 0);
+  if (opts.patterns.length === 0) refuse("watch needs at least one subject pattern");
+  for (const pattern of opts.patterns) {
+    const tokensOf = pattern.split(".");
+    if (tokensOf[0] !== "ws" || tokensOf.length < 3 || tokensOf.some((t) => t === "" || /\s/.test(t)))
+      refuse(`subject pattern "${pattern}" must look like ws.<workspace>.<…> (\`>\` ends it)`);
+    if (tokensOf[1] === "*" || tokensOf[1] === ">")
+      refuse(`subject pattern "${pattern}" reaches past your workspace — start it with ws.<your workspace>.`);
+  }
+  if (opts.resume && opts.after !== undefined) refuse("--after and --resume are alternatives");
+  if (opts.until !== undefined) {
+    const parsed = parseUntil(opts.until);
+    if (parsed.error !== undefined) refuse(parsed.error);
+    opts.untilMatch = parsed.match;
+  }
+  return opts;
+};
+
+const cursorFileOf = (patterns) => {
+  const session = isSafeSessionId(sessionIdOf()) ? sessionIdOf() : "no-session";
+  const digest = createHash("sha1").update(patterns.join(",")).digest("hex");
+  return path.join(os.homedir(), ".everdict", "watch", session, `${digest}.cursor`);
+};
+
+const readCursor = (file) => {
+  try {
+    const n = Number(readFileSync(file, "utf8").trim());
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+};
+
+const flush = (text) => new Promise((resolve) => process.stdout.write(text, () => resolve()));
+
+const watchCommand = async (ctx, tokens) => {
+  const opts = parseWatchArgs(tokens);
+  if (ctx.refusal !== undefined) refuse(ctx.refusal);
+  if (!ctx.key) refuse("no credential: set EVERDICT_API_KEY or register one in ~/.everdict/workspaces.json — nothing was sent");
+  urlOf(ctx, "/stream", []);
+  const cursorFile = cursorFileOf(opts.patterns);
+  let cursor = opts.after ?? (opts.resume ? readCursor(cursorFile) : 0);
+  const persist = () => {
+    try {
+      mkdirSync(path.dirname(cursorFile), { recursive: true });
+      writeFileSync(cursorFile, `${cursor}\n`);
+    } catch (err) {
+      say(`everdict-api: the watch cursor could not be written (${err instanceof Error ? err.message : "error"})`);
+    }
+  };
+  const idleMs = watchNumbers("EVERDICT_WATCH_IDLE_MS", [WATCH_IDLE_MS])[0];
+  const backoff = watchNumbers("EVERDICT_WATCH_BACKOFF_MS", WATCH_BACKOFF_MS);
+  const patternsParam = opts.patterns.join(",");
+
+  let connectedOnce = false;
+  let lastStatus = "unknown";
+  let attempts = 0;
+  let drops = 0;
+  let current;
+  const finish = (code) => {
+    const call = {
+      op: null,
+      method: "GET",
+      path: `/stream?${new URLSearchParams([["subjects", patternsParam], ["after", String(cursor)]]).toString()}`,
+      pathParams: {},
+      body: undefined,
+    };
+    settle(call, lastStatus === "unknown" ? { kind: "transport", cause: "never connected", attempts } : { kind: "response", status: lastStatus, text: "" }, ctx.identity);
+    return code;
+  };
+  const onSignal = (signal, code) => () => {
+    current?.abort();
+    finish(code);
+    process.exit(code);
+  };
+  process.once("SIGTERM", onSignal("SIGTERM", 143));
+  process.once("SIGINT", onSignal("SIGINT", 130));
+
+  while (true) {
+    const query = [["subjects", patternsParam], ["after", String(cursor)], ...(opts.kinds ? [["kinds", opts.kinds]] : [])];
+    current = new AbortController();
+    let idle;
+    const arm = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => current.abort(), idleMs);
+    };
+    let sawBytes = false;
+    let connected = false;
+    try {
+      arm();
+      const res = await fetch(urlOf(ctx, "/stream", query), {
+        headers: { ...headersOf(ctx), accept: "text/event-stream" },
+        signal: current.signal,
+      });
+      if (res.status !== 200) {
+        clearTimeout(idle);
+        const text = await res.text().catch(() => "");
+        lastStatus = res.status;
+        if (res.status === 401) {
+          say(`everdict-api: watch — the credential was refused (401)${text ? `: ${text.trim().slice(0, 300)}` : ""}`);
+          return finish(connectedOnce ? EXIT.credentialRefused : EXIT.refused);
+        }
+        if ([400, 403, 404].includes(res.status)) {
+          say(`everdict-api: watch refused by the gateway (${res.status}): ${text.trim().slice(0, 300)}`);
+          return finish(EXIT.refused);
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
+      connectedOnce = true;
+      connected = true;
+      lastStatus = 200;
+      attempts = 0;
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of res.body) {
+        arm();
+        if (!sawBytes) {
+          sawBytes = true;
+          drops = 0;
+        }
+        buffer += decoder.decode(chunk, { stream: true });
+        const parsed = parseSse(buffer);
+        buffer = parsed.rest;
+        for (const frame of parsed.frames) {
+          if (frame.comment) continue;
+          if (frame.event === "resync") {
+            clearTimeout(idle);
+            for (const line of resyncLines(frame.data?.oldest)) await flush(`${line}\n`);
+            return finish(EXIT.resync);
+          }
+          if (frame.event === "lagging" || frame.event === "withheld") {
+            await flush(`${opts.json ? JSON.stringify({ event: frame.event, ...frame.data }) : controlLine(frame)}\n`);
+            if (frame.pos !== undefined && frame.pos > cursor) {
+              cursor = frame.pos;
+              persist();
+            }
+            continue;
+          }
+          if (frame.pos === undefined || frame.pos <= cursor || frame.event === "live") continue;
+          await flush(`${opts.json ? JSON.stringify({ ...frame.data, pos: frame.pos }) : factLine(frame, opts.patterns)}\n`);
+          cursor = frame.pos;
+          persist();
+          if (opts.untilMatch?.(frame)) {
+            clearTimeout(idle);
+            return finish(EXIT.ok);
+          }
+        }
+      }
+      clearTimeout(idle);
+    } catch (err) {
+      clearTimeout(idle);
+      if (!connected) attempts += 1;
+      if (attempts >= WATCH_CONNECT_ATTEMPTS) {
+        say(
+          `everdict-api: watch could not connect in ${attempts} attempt(s) (${causeOf(err)}). The state of ${patternsParam} is UNKNOWN, not quiet — check the API is up, then re-arm with --resume.`,
+        );
+        return finish(EXIT.transport);
+      }
+    }
+    // The connection ended (a drop, an idle abort, a clean close) or a connect failed: back off and resume from the cursor.
+    const wait = backoff[Math.min(drops, backoff.length - 1)];
+    drops += 1;
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+};
+
+const main = async (argv) => {
+  const [head, ...rest] = argv;
+  if (head === undefined || head === "--help" || head === "-h") {
+    say("usage: everdict-api <op> [--<pathParam> <v>]… [--query k=v]… [--body <json>|@file|-] [--reason <text>] [--approval <id>]");
+    say("       everdict-api ops [filter] | describe <op> | raw <METHOD> <path> [--query k=v]… [--body …]");
+    say("       everdict-api watch <subject-pattern>[,…] [--after <pos>|--resume] [--kinds k1,k2] [--until <kind>[:<field>=<value>]] [--json]");
+    return head === undefined ? EXIT.refused : EXIT.ok;
+  }
+  if (head === "ops") return listOps(rest[0]);
+  const ctx = context();
+  if (head === "watch") {
+    // The open stream is abandoned, not drained: exit explicitly once stdout has flushed so a dangling socket cannot hold the process.
+    const code = await watchCommand(ctx, rest);
+    await flush("");
+    process.exit(code);
+  }
+  if (head === "describe") {
+    if (rest[0] === undefined) refuse("describe needs an operation name");
+    return describeOp(ctx, rest[0]);
+  }
+  if (head === "raw") {
+    const { positional, query, body, approval, reason } = parseFlags(rest, []);
+    const [method, path] = positional;
+    if (!method || !path || !path.startsWith("/")) refuse("raw takes <METHOD> </path>");
+    const verb = method.toUpperCase();
+    if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(verb)) refuse(`raw: unsupported method ${method}`);
+    const op = opForRequest(verb, path);
+    const entry = op ? findOp(op) : undefined;
+    const pathParams = {};
+    if (entry) {
+      const values = path.split("?")[0].split("/").filter(Boolean);
+      const template = entry.path.split("/").filter(Boolean);
+      template.forEach((segment, i) => {
+        const name = /^\{(\w+)\}$/.exec(segment)?.[1];
+        if (name) pathParams[name] = decodeURIComponent(values[i] ?? "");
+      });
+    }
+    return runCall(ctx, { op: op ?? null, method: verb, path, pathParams, body: readBody(body), approval, reason }, query);
+  }
+  const entry = findOp(head);
+  if (!entry)
+    refuse(
+      `unknown operation "${head}" — \`everdict-api ops\` lists them; \`raw <METHOD> <path>\` reaches a route the table lacks`,
+    );
+  const { params, query, body, approval, reason, positional } = parseFlags(rest, pathParamsOf(entry.path));
+  if (positional.length > 0) refuse(`unexpected argument "${positional[0]}"`);
+  let path;
+  try {
+    path = fillPath(entry.path, params);
+  } catch (err) {
+    return refuse(err instanceof Error ? err.message : "bad path parameters");
+  }
+  return runCall(
+    ctx,
+    { op: entry.op, method: entry.method, path, pathParams: params, body: readBody(body), approval, reason },
+    query,
+  );
+};
+
+try {
+  process.exitCode = await main(process.argv.slice(2));
+} catch (err) {
+  if (err instanceof Refusal) {
+    say(err.message);
+    process.exitCode = EXIT.refused;
+  } else {
+    say(`everdict-api: ${err instanceof Error ? err.message : "failed"}`);
+    process.exitCode = EXIT.refused;
+  }
+}

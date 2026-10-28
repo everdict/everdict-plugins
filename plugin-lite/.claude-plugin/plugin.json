@@ -1,0 +1,13 @@
+{
+  "name": "everdict-lite",
+  "description": "Use Everdict from Claude Code without the recorded development loop: one skill that maps Everdict's features to the `everdict-api` REST door, and a setup command. No hooks, no MCP server.",
+  "version": "0.3.165",
+  "author": {
+    "name": "Everdict",
+    "url": "https://github.com/everdict/everdict"
+  },
+  "homepage": "https://github.com/everdict/everdict",
+  "repository": "https://github.com/everdict/everdict",
+  "license": "Apache-2.0",
+  "keywords": ["everdict", "evaluation", "eval", "benchmark", "agent", "scorecard"]
+}

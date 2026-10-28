@@ -1,0 +1,39 @@
+# DEFAUL-816 / DEFAUL-940: the default supervisor harness Everdict ships, in format v1. One neutral source, rendered
+# for claude-code (CLAUDE.md + .claude/skills) and codex (AGENTS.md + .agents/skills) by renderHarnessV1. Content only —
+# authority and runtime config are decided server-side, and publish refuses a tree that carries either.
+format: 1
+name: supervisor
+upstream:
+  name: everdict/persona-harness
+  version: 1.13.6
+  digest: sha256:492fc50c8ce1546cafa416a58a38cfdc0018c3d9dc3e1d2ea45ebfb3b9c72bed
+# DEFAUL-1498: `knowledgeScope` (optional, at most 16 `<type>:<key>` refs, e.g. `repository:org/name`) declares what this persona
+# answers for; the brain's charter indexes the valid stances recorded over those refs. Undeclared (omitted), the charter
+# indexes the workspace's active decisions and conventions, newest first.
+charter: charter.md
+rules:
+  - goals
+  - proactive
+  - communication
+  - contribution
+  - permission
+  - delegation
+skills:
+  - orient
+  - set-goals
+  - propose
+  - converse
+  - contribute
+  - ask-permission
+  - supervise
+  - judge
+  - report-up
+  - coordinate
+  - delegate
+  - record
+  - improve-harness
+  - draft-model
+  - triage-findings
+# DEFAUL-1091: how often a brain with an empty inbox is woken idle to look for value nobody asked for; the interval doubles
+# per fruitless wake up to maxMinutes. `idleWake: off` turns it off.
+idleWake: { minutes: 240, maxMinutes: 1440 }
